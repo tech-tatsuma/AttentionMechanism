@@ -1,58 +1,48 @@
-from torch import nn
+import tensorflow as tf
 
-from NLP.scale_dot_product_attention import ScaleDotProductAttention
+def multihead_attention(queries, keys, values, key_masks,
+                        num_heads=8, 
+                        dropout_rate=0,
+                        training=True,
+                        causality=False,
+                        scope="multihead_attention"):
+    '''
+    マルチヘッドアテンションを適用します。3.2.2を参照。
+        queries: 形状が[N, T_q, d_model]の3次元テンソル。
+        keys: 形状が[N, T_k, d_model]の3次元テンソル。
+        values: 形状が[N, T_k, d_model]の3次元テンソル。
+        key_masks: 形状が[N, key_seqlen]の2次元テンソル。
+        num_heads: 整数。ヘッドの数。
+        dropout_rate: 浮動小数点数。ドロップアウト率。
+        training: ブール値。ドロップアウトの制御用。
+        causality: ブール値。Trueの場合、未来の情報を参照するユニットがマスクされます。
+        scope: オプションの`variable_scope`。
 
+        戻り値
+        形状が(N, T_q, C)の3次元テンソル
+    '''
+    d_model = queries.get_shape().as_list()[-1] # クエリの最終次元のサイズを取得
+    with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
+        # 線形変換
+        Q = tf.layers.dense(queries, d_model, use_bias=True) # (N, T_q, d_model) クエリを線形変換
+        K = tf.layers.dense(keys, d_model, use_bias=True) # (N, T_k, d_model) キーを線形変換
+        V = tf.layers.dense(values, d_model, use_bias=True) # (N, T_k, d_model) 値を線形変換
+        
+        # 分割して結合
+        Q_ = tf.concat(tf.split(Q, num_heads, axis=2), axis=0) # (h*N, T_q, d_model/h) Qをヘッド数に分割し結合
+        K_ = tf.concat(tf.split(K, num_heads, axis=2), axis=0) # (h*N, T_k, d_model/h) Kをヘッド数に分割し結合
+        V_ = tf.concat(tf.split(V, num_heads, axis=2), axis=0) # (h*N, T_k, d_model/h) Vをヘッド数に分割し結合
 
-class MultiHeadAttention(nn.Module):
+        # Attention
+        outputs = scaled_dot_product_attention(Q_, K_, V_, key_masks, causality, dropout_rate, training) # スケール付きドットプロダクトアテンションを適用
 
-    def __init__(self, d_model, n_head):
-        super(MultiHeadAttention, self).__init__()
-        self.n_head = n_head # ヘッド数を保存
-        self.attention = ScaleDotProductAttention() # スケールドットプロダクトアテンションのインスタンスを生成
-        self.w_q = nn.Linear(d_model, d_model) # クエリの線形変換用の重み
-        self.w_k = nn.Linear(d_model, d_model) # キーの線形変換用の重み
-        self.w_v = nn.Linear(d_model, d_model) # バリューの線形変換用の重み
-        self.w_concat = nn.Linear(d_model, d_model) # 最終的な出力の線形変換用の重み
-
-    def forward(self, q, k, v, mask=None):
-        # 1. 重み行列を使用してドットプロダクトを計算
-        q, k, v = self.w_q(q), self.w_k(k), self.w_v(v)
-
-        # 2. テンソルをヘッド数で分割
-        q, k, v = self.split(q), self.split(k), self.split(v)
-
-        # 3. スケールドットプロダクトアテンションを計算して類似性を求める
-        out, attention = self.attention(q, k, v, mask=mask)
-
-        # 4. 結果を結合して線形層に通す
-        out = self.concat(out)
-        out = self.w_concat(out)
-
-        return out
-
-    def split(self, tensor):
-        """
-        テンソルをヘッドの数で分割する
-
-        :param tensor: [batch_size, length, d_model]
-        :return: [batch_size, head, length, d_tensor]
-        """
-        batch_size, length, d_model = tensor.size() # テンソルのサイズを取得
-
-        d_tensor = d_model // self.n_head # 各ヘッドの次元数を計算
-        tensor = tensor.view(batch_size, length, self.n_head, d_tensor).transpose(1, 2) # テンソルをヘッドの数に基づいて分割し，次元を入れ替える
-
-        return tensor
-
-    def concat(self, tensor):
-        """
-        self.split(tensor : torch.Tensor)の逆関数
-
-        :param tensor: [batch_size, head, length, d_tensor]
-        :return: [batch_size, length, d_model]
-        """
-        batch_size, head, length, d_tensor = tensor.size() # テンソルのサイズを取得
-        d_model = head * d_tensor # 元の次元数を計算
-
-        tensor = tensor.transpose(1, 2).contiguous().view(batch_size, length, d_model) #次元を元に戻してテンソルを連結
-        return tensor
+        # 形状を元に戻す
+        outputs = tf.concat(tf.split(outputs, num_heads, axis=0), axis=2 ) # (N, T_q, d_model) ヘッド数に分割された出力を結合し元の形状に戻す
+              
+        # 残差接続
+        outputs += queries # 残差接続を適用
+              
+        # 正規化
+        outputs = ln(outputs) # レイヤー正規化を適用
+ 
+    return outputs

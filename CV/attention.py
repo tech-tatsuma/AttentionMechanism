@@ -1,38 +1,72 @@
-import torch
-from torch import nn
+from typing import List
 
-class Attention(nn.Module):
-    def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
-        super().__init__()
-        inner_dim = dim_head *  heads  # 内部次元を定義（ヘッド数 × 各ヘッドの次元）
-        project_out = not (heads == 1 and dim_head == dim)  # 出力プロジェクションが必要かを判定
+import tensorflow as tf
+from tensorflow.keras import Model, layers
 
-        self.heads = heads  # ヘッド数を保存
-        self.scale = dim_head ** -0.5  # スケールファクタを定義（通常は次元の平方根の逆数）
+class MultiHeadSelfAttention(layers.Layer):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        drop_rate: float = 0.,
+        **kwargs):
+        super().__init__(**kwargs)
 
-        self.norm = nn.LayerNorm(dim)  # 入力を正規化するレイヤー
+        self.hidden_dim = hidden_dim # 隠れ次元の設定
+        self.num_heads = num_heads # ヘッド数の設定
+        self.drop_rate = drop_rate # ドロップアウトの設定
 
-        self.attend = nn.Softmax(dim = -1)  # ソフトマックス関数（最後の次元で正規化）
-        self.dropout = nn.Dropout(dropout)  # ドロップアウトを定義
+    def build(self, input_shape: List[tf.TensorShape]) -> None: 
+        # Denseレイヤーの定義
+        self.d_query = layers.Dense(self.hidden_dim, name='MHA_query') # クエリ用のDenseレイヤー
+        self.d_key = layers.Dense(self.hidden_dim, name='MHA_query') # キー用のDenseレイヤー
+        self.d_value = layers.Dense(self.hidden_dim, name='MHA_query') # バリュー用のDenseレイヤー
 
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)  # クエリ、キー、バリューを一度に計算するための線形変換
+        # 形状変換レイヤーの定義
+        self.reshape = layers.Reshape(
+                target_shape=(-1, self.num_heads, self.hidden_dim//self.num_heads)
+                ) # マルチヘッド用に形状を変換
+        # パーミュテーションレイヤーの定義
+        self.perm = layers.Permute(dims = (2,1,3)) # テンソルの次元を入れ替える
 
-        self.to_out = nn.Sequential(  # 出力プロジェクションを定義（必要な場合のみ）
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout)
-        ) if project_out else nn.Identity()  # プロジェクションが不要な場合は恒等関数
+        # softmaxレイヤーの定義
+        self.softmax = layers.Activation(activation = 'softmax', name = 'qkt_softmax')
 
-    def forward(self, x):
-        x = self.norm(x)  # 入力を正規化
+        # ドロップアウトレイヤーの定義
+        self.dropout = layers.Dropout(rate = self.drop_rate) # ドロップアウト
 
-        qkv = self.to_qkv(x).chunk(3, dim = -1)  # クエリ、キー、バリューを分割
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)  # 各ヘッドに分割し並び替え
+        # 出力用の形状変換とDenseレイヤーの定義
+        self.reshape_f = layers.Reshape(target_shape = (-1, self.hidden_dim)) # 元の形状に戻すためのReshape
+        self.dense = layers.Dense(units = self.hidden_dim) # 出力用のDenseレイヤー
 
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # クエリとキーの内積を計算し、スケーリング
+    def reshape_and_perm(self, inputs: tf.Tensor) -> tf.Tensor:
+        x = self.reshape(inputs) # 形状変換
+        return self.perm(x) #次元の入れ替え
 
-        attn = self.attend(dots)  # ソフトマックスを適用し、注意重みを計算
-        attn = self.dropout(attn)  # ドロップアウトを適用
+    def call(self, inputs: List[tf.Tensor]) -> tf.Tensor:
+        # Denseレイヤーを適用
+        query = self.reshape_and_perm(self.d_query(inputs)) # クエリの変換
+        key = self.reshape_and_perm(self.d_key(inputs)) # キーの変換
+        value = self.reshape_and_perm(self.d_value(inputs)) # バリューの変換
 
-        out = torch.matmul(attn, v)  # 注意重みとバリューの内積を計算
-        out = rearrange(out, 'b h n d -> b n (h d)')  # 元の形に並び替え
-        return self.to_out(out)  # 出力プロジェクションを適用し、出力を返す
+        # qkt = QK^T
+        qkt = tf.matmul(a = query, b = key, transpose_b = True) # クエリとキーの行列積
+
+        # qkt = softmax(qkt/sqrt(dim))
+        d_k = tf.cast(self.hidden_dim, dtype=qkt.dtype) # 隠れ次元をテンソルの型にキャスト
+        qkt = self.softmax(qkt / tf.sqrt(d_k)) # スケーリングしてソフトマックスを適用
+
+        # ドロップアウトの適用
+        qkt = self.dropout(qkt) # ドロップアウト
+
+        # qktV
+        attn = qkt @ value # スコアとバリューの行列積(アテンションスコアの計算)
+
+        # [Batch, num_heads, patch^2+1, dim // num_heads] -> [Batch, patch^2+1, dim]
+        attn = self.perm(attn) # 次元の入れ替え
+        attn = self.reshape_f(attn) # 元の形状に戻す
+
+        # 最終的なDenseレイヤーの適用（マルチヘッドアテンションを統合）
+        out = self.dense(attn) # Denseレイヤーを適用して出力
+
+        return out

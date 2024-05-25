@@ -1,36 +1,50 @@
-import math
+"""
+inplementation of scaled dot-product attention from https://github.com/Kyubyong/transformer
+"""
+import tensorflow as tf
 
-from torch import nn
+def scaled_dot_product_attention(Q, K, V, key_masks,
+                                 causality=False, dropout_rate=0.,
+                                 training=True,
+                                 scope="scaled_dot_product_attention"):
+    '''
+    Q: クエリをパックしたもの。3次元テンソル。[N, T_q, d_k]。
+    K: キーをパックしたもの。3次元テンソル。[N, T_k, d_k]。
+    V: 値をパックしたもの。3次元テンソル。[N, T_k, d_v]。
+    key_masks: [N, key_seqlen]の形状を持つ2次元テンソル。
+    causality: Trueの場合、将来の情報を隠すためのマスキングを適用。
+    dropout_rate: [0, 1]の浮動小数点数。
+    training: ドロップアウトを制御するためのブール値。
+    scope: オプションの`variable_scope`。
+    '''
+    with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
+        d_k = Q.get_shape().as_list()[-1] # クエリの最終次元のサイズを取得
 
+        # 内積の計算
+        outputs = tf.matmul(Q, tf.transpose(K, [0, 2, 1]))  # (N, T_q, T_k) クエリとキーの転置行列との行列積
 
-class ScaleDotProductAttention(nn.Module):
-    """
-    Query : 注目している文(Decoder)
-    Key : Queryとの関係を調べる全ての文(Encoder)
-    Value : Keyと同じ全ての文(Encoder)
-    """
+        # スケーリング
+        outputs /= d_k ** 0.5
 
-    def __init__(self):
-        super(ScaleDotProductAttention, self).__init__()
-        self.softmax = nn.Softmax(dim=-1) # USER:関数の定義
+        # キーマスキング
+        outputs = mask(outputs, key_masks=key_masks, type="key") # キーマスクを適用
 
-    def forward(self, q, k, v, mask=None, e=1e-12):
-        # 入力は4次元テンソルを想定
-        # [バッチサイズ, ヘッド数, 長さ, テンソルの次元数]
-        batch_size, head, length, d_tensor = k.size()
+        # 因果性マスキングまたは未来のブラインディング
+        if causality:
+            outputs = mask(outputs, type="future") # 因果性マスクを適用
 
-        # 1. QueryとKey^Tのドット積（内積）を計算して類似度を求める
-        k_t = k.transpose(2, 3)  # 転置処理
-        score = (q @ k_t) / math.sqrt(d_tensor)  # scaled dot product
+        # ソフトマックス
+        outputs = tf.nn.softmax(outputs) # ソフトマックス関数を適用して正規化
+        attention = tf.transpose(outputs, [0, 2, 1]) # attention行列を転置
+        tf.summary.image("attention", tf.expand_dims(attention[:1], -1)) # TensorBoard用に注意行列の画像を出力
 
-        # 2. マスクの適用(任意)
-        if mask is not None:
-            score = score.masked_fill(mask == 0, -10000)
+        # # クエリマスキング
+        # outputs = mask(outputs, Q, K, type="query")
 
-        # 3. USER:を通して[0,1]の範囲にする
-        score = self.softmax(score)
+        # ドロップアウト
+        outputs = tf.layers.dropout(outputs, rate=dropout_rate, training=training)
 
-        # 4. Valueと掛け算をする
-        v = score @ v
+        # 重み付け和 (コンテキストベクトル)
+        outputs = tf.matmul(outputs, V)  # (N, T_q, d_v) 出力と値の行列積を計算
 
-        return v, score # アテンションの結果とスコアを返す
+    return outputs
